@@ -1,6 +1,6 @@
 # Lot Analyzer
 
-A Python tool to find optimal stock lots to donate for maximum tax benefit, specifically tailored for high-income California residents.
+A Python tool to find optimal stock lots to donate for maximum tax benefit.
 
 ## Features
 
