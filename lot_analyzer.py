@@ -2,9 +2,17 @@
 """
 Lot Analyzer - Find optimal lots to donate for maximum tax benefit
 
-Usage: python lot_analyzer.py [amount_in_thousands]
-  e.g. python lot_analyzer.py 500    # Target $500,000
-       python lot_analyzer.py 2000   # Target $2,000,000
+Usage: python lot_analyzer.py [amount_in_thousands] [--input PATH] [--live]
+  e.g. python lot_analyzer.py 500                # Target $500,000 using default 'assets' dir
+       python lot_analyzer.py 2000 --input file.csv # Target $2,000,000 using specific file
+       python lot_analyzer.py 1000 --live        # Use live prices for analysis
+
+Features:
+  - Supports standard 'Lot Details' CSV exports and 'Schwab Aligned' format.
+  - Automatically filters out ineligible lots (less than 1 whole share).
+  - Ensures recommendations only include whole shares (no fractional donations).
+  - Rounds up partial lot selections to meet or exceed the target donation amount.
+  - Provides a 'Lot Size' column to disambiguate lots from the same date.
 
 Tax rates for high-income California resident:
   Federal ordinary income:     37.0%
@@ -28,9 +36,11 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import yfinance as yf
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich.progress import Progress, SpinnerColumn, TextColumn
 
 console = Console(width=120)
 
@@ -95,6 +105,77 @@ def format_money(val: int) -> str:
     return f"${val:,}"
 
 
+def fetch_current_prices(tickers: list[str]) -> dict[str, float]:
+    """Fetch current market prices for a list of tickers using yfinance."""
+    if not tickers:
+        return {}
+
+    prices = {}
+    unique_tickers = sorted(list(set(tickers)))
+    
+    # Join tickers with space for yfinance bulk download
+    tickers_str = " ".join(unique_tickers)
+    
+    try:
+        # download period="1d" to get the latest available price
+        data = yf.download(tickers_str, period="1d", progress=False)
+        
+        # Handle single ticker vs multiple tickers structure
+        if len(unique_tickers) == 1:
+            # For single ticker, data['Close'] is a Series
+            current_price = data['Close'].iloc[-1]
+            if isinstance(current_price, pd.Series): # Handle case where it might still be a series
+                 current_price = current_price.iloc[0]
+            prices[unique_tickers[0]] = float(current_price)
+        else:
+            # For multiple tickers, data['Close'] is a DataFrame
+            for ticker in unique_tickers:
+                try:
+                    # Get the last available close price
+                    price = data['Close'][ticker].iloc[-1]
+                    if pd.notna(price):
+                        prices[ticker] = float(price)
+                except KeyError:
+                    console.print(f"[yellow]Warning: Could not find price for {ticker}[/yellow]")
+
+    except Exception as e:
+        console.print(f"[red]Error fetching prices: {e}[/red]")
+        
+    return prices
+
+
+def update_lots_with_live_prices(df: pd.DataFrame, prices: dict[str, float]) -> pd.DataFrame:
+    """Recalculate Market Value, Gain/Loss ($), and Gain/Loss (%) based on live prices."""
+    if df.empty or not prices:
+        return df
+
+    df = df.copy()
+    
+    # Helper to apply updates row by row
+    def update_row(row):
+        ticker = row.get("Ticker")
+        if ticker not in prices:
+            return row
+            
+        current_price = prices[ticker]
+        quantity = parse_float(row.get("Quantity", 0))
+        cost_basis = parse_money(row.get("Cost Basis", 0))
+        
+        # Recalculate values
+        new_market_value = quantity * current_price
+        new_gain_loss = new_market_value - cost_basis
+        new_gain_pct = (new_gain_loss / cost_basis * 100) if cost_basis > 0 else 0.0
+        
+        # Update row
+        row["Market Value"] = f"${new_market_value:,.2f}"
+        row["Gain/Loss ($)"] = f"${new_gain_loss:,.2f}"
+        row["Gain/Loss (%)"] = f"{new_gain_pct:.2f}%"
+        
+        return row
+
+    return df.apply(update_row, axis=1)
+
+
 def calc_efficiency(gain_pct: float) -> float:
     """
     Calculate tax efficiency (tax benefit per dollar donated) for a given gain percentage.
@@ -103,18 +184,28 @@ def calc_efficiency(gain_pct: float) -> float:
       - 100% means the stock doubled (gain equals cost basis)
       - 50% means 50% gain on cost basis
 
-    For efficiency, we need gain as a fraction of MARKET VALUE:
-      gain_ratio = gain / market_value = gain / (cost + gain)
-                 = (gain_pct/100) / (1 + gain_pct/100)
-                 = gain_pct / (100 + gain_pct)
+    For efficiency, we need gain (or loss) as a fraction of MARKET VALUE:
+      gain_ratio = gain / market_value = gain_pct / (100 + gain_pct)
+      loss_ratio = loss / market_value = loss_pct / (100 - loss_pct)
 
-    Efficiency = deduction_rate + (gain_ratio × ltcg_rate)
+    Gains:  deduction value  + avoided LTCG on the gain portion
+    Losses: deduction value  - forfeited ability to harvest the loss
     """
-    if gain_pct <= 0:
+    if gain_pct == 0:
         return COMBINED_ORDINARY  # No gain = just the deduction value
 
-    gain_ratio = gain_pct / (100 + gain_pct)  # gain as fraction of market value
-    return COMBINED_ORDINARY + (gain_ratio * COMBINED_LTCG)
+    # Positive gain: avoid paying cap gains on the appreciated portion
+    if gain_pct > 0:
+        gain_ratio = gain_pct / (100 + gain_pct)  # gain as fraction of market value
+        return COMBINED_ORDINARY + (gain_ratio * COMBINED_LTCG)
+
+    # Negative gain: donating forfeits the tax benefit of realizing the loss
+    loss_pct = abs(gain_pct)
+    if loss_pct >= 100:  # Avoid divide by zero when market value ~0
+        return 0.0
+
+    loss_ratio = loss_pct / (100 - loss_pct)  # loss as fraction of market value
+    return COMBINED_ORDINARY - (loss_ratio * COMBINED_LTCG)
 
 
 def is_full_lot(fraction: float) -> bool:
@@ -125,6 +216,7 @@ def is_full_lot(fraction: float) -> bool:
 def calc_lot_values(row: pd.Series, fraction: float = 1.0) -> tuple[int, int, int, float, float, str, str]:
     """
     Calculate values for a lot, optionally with a fraction applied.
+    Ensures only whole shares are counted (no fractional donations).
     Returns: (market_val, cost_basis, gain_loss, gain_pct, quantity, open_date, ticker)
     """
     full_market = parse_money(row.get("Market Value", 0))
@@ -135,12 +227,72 @@ def calc_lot_values(row: pd.Series, fraction: float = 1.0) -> tuple[int, int, in
     open_date = str(row.get("Open Date", ""))
     ticker = str(row.get("Ticker", ""))
 
-    market_val = int(full_market * fraction)
-    cost_basis = int(full_cost * fraction)
-    gain_loss = int(full_gain * fraction)
-    quantity = full_qty * fraction
+    # Ensure quantity is an integer (no fractional shares)
+    quantity = float(math.floor(full_qty * fraction))
+    
+    # Recalculate values based on whole shares to ensure accuracy
+    if full_qty > 0 and not math.isclose(quantity, full_qty, rel_tol=1e-9):
+        # Scale based on price per share
+        share_price = full_market / full_qty
+        cost_per_share = full_cost / full_qty
+        market_val = int(share_price * quantity)
+        cost_basis = int(cost_per_share * quantity)
+        gain_loss = market_val - cost_basis
+    else:
+        # Use full lot values from CSV if taking the whole thing (and it's already integer)
+        # If the original lot was fractional, the 'if' above catches it even with fraction=1.0
+        market_val = full_market
+        cost_basis = full_cost
+        gain_loss = full_gain
 
     return market_val, cost_basis, gain_loss, gain_pct, quantity, open_date, ticker
+
+
+def parse_schwab_row(row: list[str]) -> dict[str, Any] | None:
+    """Parse a single row from Schwab export (aligned format)."""
+    if not row or len(row) < 15:
+        return None
+        
+    # Index 0 is always Symbol/Ticker
+    ticker = row[0]
+    
+    # Aligned format indices
+    # "Symbol","Open Date","Transaction Open","Quantity","Price","Cost/Share","Transaction CPS","Market Value","Cost Basis","Transaction CB","Gain/Loss ($)","Transaction G/L $","Gain/Loss (%)","Transaction G/L %","Holding Period","Disallowed Loss"
+    # 0: Sym, 1: Date, 3: Qty, 7: Mkt Val, 8: Cost Basis, 10: Gain $, 12: Gain %, 14: Holding Period
+    
+    return {
+        "Ticker": ticker,
+        "Open Date": row[1],
+        "Quantity": row[3],
+        "Market Value": row[7],
+        "Cost Basis": row[8],
+        "Gain/Loss ($)": row[10],
+        "Gain/Loss (%)": row[12],
+        "Holding Period": row[14]
+    }
+
+
+def load_schwab_complete_csv(filepath: str) -> pd.DataFrame:
+    """Load a Schwab complete lots CSV export."""
+    import csv
+    
+    data = []
+    with open(filepath, "r", encoding="utf-8-sig") as f:
+        reader = csv.reader(f)
+        try:
+            next(reader) # Skip header
+        except StopIteration:
+            return pd.DataFrame()
+            
+        for row in reader:
+            parsed = parse_schwab_row(row)
+            if parsed:
+                data.append(parsed)
+                
+    if not data:
+        return pd.DataFrame()
+        
+    return pd.DataFrame(data)
 
 
 def load_csv_file(filepath: str) -> pd.DataFrame:
@@ -148,6 +300,10 @@ def load_csv_file(filepath: str) -> pd.DataFrame:
     # Use utf-8-sig to handle BOM in Windows CSV exports
     with open(filepath, "r", encoding="utf-8-sig") as f:
         first_line = f.readline()
+
+    # Check for Schwab Aligned format
+    if first_line.startswith('"Symbol","Open Date","Transaction Open"'):
+        return load_schwab_complete_csv(filepath)
 
     # Support tickers with dots or hyphens (e.g. BRK.B)
     ticker_match = re.match(r'^"?([\w.-]+)\s+Lot Details', first_line)
@@ -164,15 +320,24 @@ def load_csv_file(filepath: str) -> pd.DataFrame:
     return df
 
 
-def load_all_lots(assets_dir: str) -> pd.DataFrame:
-    """Load all lots from all CSV files in assets directory."""
+def load_all_lots(path_str: str) -> pd.DataFrame:
+    """Load lots from a single CSV file or all CSV files in a directory."""
+    path = Path(path_str)
     all_dfs = []
-    csv_files = list(Path(assets_dir).glob("*.csv"))
 
-    for filepath in csv_files:
-        df = load_csv_file(str(filepath))
+    if path.is_file():
+        df = load_csv_file(str(path))
         if not df.empty:
             all_dfs.append(df)
+    elif path.is_dir():
+        csv_files = list(path.glob("*.csv"))
+        for filepath in csv_files:
+            df = load_csv_file(str(filepath))
+            if not df.empty:
+                all_dfs.append(df)
+    else:
+        console.print(f"[red]Error: {path_str} is not a valid file or directory[/red]")
+        return pd.DataFrame()
 
     if not all_dfs:
         return pd.DataFrame()
@@ -190,7 +355,7 @@ def print_table(df: pd.DataFrame, title: str) -> None:
 
     table.add_column("Ticker", style="bold", no_wrap=True)
     table.add_column("Date", no_wrap=True)
-    table.add_column("Qty", justify="right", no_wrap=True)
+    table.add_column("Lot Size", justify="right", no_wrap=True)
     table.add_column("Market Val", justify="right", style="green", no_wrap=True)
     table.add_column("Cost Basis", justify="right", no_wrap=True)
     table.add_column("Gain", justify="right", style="bold green", no_wrap=True)
@@ -255,8 +420,9 @@ def print_recommended_lots(df: pd.DataFrame, last_lot_fraction: float, target: i
 
     table.add_column("Ticker", style="bold", no_wrap=True)
     table.add_column("Date", no_wrap=True)
+    table.add_column("Lot Size", justify="right", no_wrap=True)
     table.add_column("Fraction", justify="right", no_wrap=True)
-    table.add_column("Shares", justify="right", no_wrap=True)
+    table.add_column("Donating", justify="right", style="bold", no_wrap=True)
     table.add_column("Market Val", justify="right", style="green", no_wrap=True)
     table.add_column("Cost Basis", justify="right", no_wrap=True)
     table.add_column("Gain", justify="right", style="bold green", no_wrap=True)
@@ -275,6 +441,9 @@ def print_recommended_lots(df: pd.DataFrame, last_lot_fraction: float, target: i
         frac = last_lot_fraction if is_last else 1.0
 
         market_val, cost_basis, gain_loss, gain_pct, quantity, open_date, ticker = calc_lot_values(row, frac)
+        
+        # Get total lot size (full whole shares)
+        _, _, _, _, full_qty, _, _ = calc_lot_values(row, 1.0)
 
         running_total += market_val
         total_market += market_val
@@ -289,6 +458,7 @@ def print_recommended_lots(df: pd.DataFrame, last_lot_fraction: float, target: i
         table.add_row(
             ticker,
             open_date,
+            f"{full_qty:,.0f}",
             frac_str,
             f"{quantity:,.0f}",
             format_money(market_val),
@@ -310,6 +480,7 @@ def print_recommended_lots(df: pd.DataFrame, last_lot_fraction: float, target: i
     table.add_row(
         "[bold]TOTAL[/bold]",
         "",
+        "",
         f"[bold]{lot_desc}[/bold]",
         "",
         f"[bold]{format_money(total_market)}[/bold]",
@@ -328,7 +499,7 @@ def select_lots_for_target(df: pd.DataFrame, target: int) -> tuple[pd.DataFrame,
     """
     Select lots to reach target donation amount. Highest gain % first.
     Returns (selected_df, fraction_of_last_lot).
-    The last lot may be partial to hit target exactly.
+    The last lot may be partial to hit target (only whole shares).
     """
     if df.empty:
         return df, 1.0
@@ -342,7 +513,12 @@ def select_lots_for_target(df: pd.DataFrame, target: int) -> tuple[pd.DataFrame,
     fraction_of_last = 1.0
 
     for idx, row in sorted_df.iterrows():
-        market_val = parse_money(row["Market Value"])
+        # Get lot values for the full lot (ensures whole shares)
+        market_val, _, _, _, full_qty, _, _ = calc_lot_values(row, 1.0)
+        
+        # Skip lots that have 0 whole shares (market value effectively 0)
+        if market_val <= 0:
+            continue
 
         if total >= target:
             break
@@ -350,19 +526,31 @@ def select_lots_for_target(df: pd.DataFrame, target: int) -> tuple[pd.DataFrame,
         remaining_needed = target - total
 
         if market_val <= remaining_needed:
-            # Take the whole lot
+            # Take the whole lot (whole shares only)
             selected_indices.append(idx)
             total += market_val
             fraction_of_last = 1.0
         else:
-            # Take a fraction of this lot to hit target exactly
-            selected_indices.append(idx)
-            # Guard against division by zero
-            if market_val > 0:
-                fraction_of_last = remaining_needed / market_val
-            else:
-                fraction_of_last = 0.0
-            total = target
+            # Take a partial lot, but only whole shares
+            if full_qty > 0:
+                share_price = market_val / full_qty
+                # Guard against division by zero if share price is somehow 0
+                if share_price > 0:
+                    shares_needed = remaining_needed / share_price
+                    # Use ceil to ensure we meet or exceed the target
+                    whole_shares = math.ceil(shares_needed)
+                    
+                    # Ensure we don't try to take more than available in this lot
+                    if whole_shares > full_qty:
+                        whole_shares = math.floor(full_qty) # Fallback to taking max available
+                        
+                    if whole_shares > 0:
+                        selected_indices.append(idx)
+                        fraction_of_last = whole_shares / full_qty
+                        total += int(share_price * whole_shares)
+                    else:
+                        # Should not happen if shares_needed > 0 and using ceil
+                        pass
             break
 
     return sorted_df.loc[selected_indices], fraction_of_last
@@ -396,10 +584,27 @@ def main() -> None:
         default=1000,
         help="Target donation amount in thousands of dollars (default: 1000 = $1M)",
     )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Fetch live market prices (yfinance) and recalculate lots before analysis",
+    )
+    parser.add_argument(
+        "--input",
+        "-i",
+        type=str,
+        default=None,
+        help="Path to a single CSV file or a directory containing CSV files (default: 'assets' subdirectory)",
+    )
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    assets_dir = os.path.join(script_dir, "assets")
+    
+    if args.input:
+        input_path = args.input
+    else:
+        input_path = os.path.join(script_dir, "assets")
+
     target_amount = args.amount * 1000
 
     console.print()
@@ -410,17 +615,45 @@ def main() -> None:
         )
     )
 
-    all_lots = load_all_lots(assets_dir)
+    all_lots = load_all_lots(input_path)
 
     if all_lots.empty:
-        console.print("[red]No lots found! Check the assets directory.[/red]")
+        console.print(f"[red]No lots found in {input_path}![/red]")
         return
 
+    # Fetch live prices if requested
+    if args.live:
+        tickers = all_lots["Ticker"].unique().tolist()
+        # Filter out UNKNOWN tickers
+        tickers = [t for t in tickers if t != "UNKNOWN"]
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            transient=True,
+        ) as progress:
+            progress.add_task(description=f"Fetching live prices for {len(tickers)} tickers...", total=None)
+            prices = fetch_current_prices(tickers)
+            
+        if prices:
+            console.print(f"[green]Updated prices for {len(prices)} tickers.[/green]")
+            all_lots = update_lots_with_live_prices(all_lots, prices)
+        else:
+            console.print("[yellow]No live prices fetched. Using CSV values.[/yellow]")
+        console.print()
+
     long_term = all_lots[all_lots["Holding Period"] == "Long Term"].copy()
+    
+    # Filter out lots with less than 1 whole share (ineligible for donation)
+    # parsing quantities to float, flooring, and checking >= 1
+    long_term = long_term[long_term["Quantity"].apply(lambda x: math.floor(parse_float(x))) >= 1]
+    
     short_term = all_lots[all_lots["Holding Period"] == "Short Term"].copy()
 
     total_lt_value = sum(parse_money(v) for v in long_term["Market Value"])
     total_lt_gain = sum(parse_money(v) for v in long_term["Gain/Loss ($)"])
+    
+    total_all_value = sum(parse_money(v) for v in all_lots["Market Value"])
 
     # Summary stats
     stats_table = Table(show_header=False, box=None)
@@ -429,6 +662,7 @@ def main() -> None:
     stats_table.add_row("Total lots loaded", f"{len(all_lots)}")
     stats_table.add_row("Long-term lots", f"{len(long_term)}")
     stats_table.add_row("Short-term lots", f"{len(short_term)}")
+    stats_table.add_row("Total market value", format_money(total_all_value))
     stats_table.add_row("Long-term market value", format_money(total_lt_value))
     stats_table.add_row("Long-term unrealized gain", format_money(total_lt_gain))
     console.print(stats_table)
@@ -451,11 +685,12 @@ def main() -> None:
             "[bold red]CRITICAL:[/bold red] Long-term → deduct FULL MARKET VALUE\n"
             "          Short-term → only deduct COST BASIS!\n\n"
             "[bold cyan]EFFICIENCY[/bold cyan] = Tax benefit per $1 donated (long-term only)\n"
-            "  Formula: 50.3% + (gain/market_value) × 37.1%\n"
+            "  Formula: 50.3% + (gain/market_value) × 37.1% (losses subtract that term)\n"
             "  [dim]200% gain (tripled) →  75% efficiency (75¢ per $1 donated)[/dim]\n"
             "  [dim]100% gain (doubled) →  69% efficiency (69¢ per $1 donated)[/dim]\n"
             "  [dim] 50% gain           →  63% efficiency[/dim]\n"
-            "  [dim]  0% gain           →  50% efficiency (just the deduction)[/dim]\n\n"
+            "  [dim]  0% gain           →  50% efficiency (just the deduction)[/dim]\n"
+            "  [dim]Loss lots are inefficient to donate; better to harvest loss then give cash[/dim]\n\n"
             "[bold yellow]AGI LIMITATION:[/bold yellow] Appreciated stock deductions limited to 30% of AGI.\n"
             "  [dim]$1M donation requires $3.33M+ AGI. Excess carries forward 5 years.[/dim]",
             title="Tax Strategy (CA + Federal)",
